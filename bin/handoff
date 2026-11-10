@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# handoff: COPY a coding-agent session (and its project) to another machine over ssh,
+# and resume it there in a Herdr terminal. The local session is left untouched.
+#
+# Agents: claude, codex, opencode. Target: any ssh alias from ~/.ssh/config
+# (boxd VMs appear as <vm>.boxd) or user@host.
+#
+# Usage (run from inside the project folder):
+#   handoff <agent> <ssh-alias>                # newest session of this folder
+#   handoff <agent> <ssh-alias> <session-id>   # a specific session
+#   handoff <agent> --list                     # this folder's sessions, newest first
+#   handoff --hosts                            # Hosts in ~/.ssh/config
+#
+# Env:
+#   HANDOFF_HOST=my-vm.boxd         default alias when none is given
+#   HANDOFF_DEST=~/code             parent folder for the project there (default: remote $HOME)
+#   HANDOFF_AGENT_ARGS="..."        extra flags for the agent there
+#   HANDOFF_ENV=1                   also copy gitignored .env* files
+#   HANDOFF_NO_HERDR=1              copy only; print the resume command instead of opening Herdr
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+die() { echo "handoff: $*" >&2; exit 1; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+enc() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }   # Claude's project-folder encoding
+ts() { date -r "$1" '+%Y-%m-%d %H:%M'; }
+
+case "${1:-}" in
+  ""|-h|--help) usage ;;
+  --hosts) awk 'tolower($1)=="host"{for(i=2;i<=NF;i++) if($i !~ /[*?]/) print $i}' ~/.ssh/config | sort -u; exit 0 ;;
+esac
+AGENT="$1"; shift
+case "$AGENT" in claude|codex|opencode) ;; *) die "unknown agent '$AGENT' (claude, codex or opencode)";; esac
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+NAME="$(basename "$ROOT")"
+CWD="$(pwd -P)"; [ "${CWD#$ROOT}" = "$CWD" ] && CWD="$ROOT"   # folder the agent ran in (may be a subfolder)
+
+# ---------- per-agent: list sessions for this folder (newest first): "<id>\t<when>\t<title>" ----------
+list_sessions() {
+  case "$AGENT" in
+    claude)
+      local d="$HOME/.claude/projects/$(enc "$CWD")"
+      [ -d "$d" ] || return 0
+      ls -t "$d"/*.jsonl 2>/dev/null | while read -r f; do
+        printf '%s\t%s\t\n' "$(basename "$f" .jsonl)" "$(ts "$f")"
+      done ;;
+    codex)
+      [ -d "$HOME/.codex/sessions" ] || return 0
+      find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -print0 | xargs -0 ls -t 2>/dev/null | while read -r f; do
+        head -1 "$f" | python3 -I -c '
+import json, sys
+m = json.loads(sys.stdin.readline() or "{}").get("payload", {})
+if m.get("cwd") == sys.argv[1]: print(m.get("id", ""))' "$CWD" | while read -r id; do
+          [ -n "$id" ] && printf '%s\t%s\t\n' "$id" "$(ts "$f")"
+        done
+      done ;;
+    opencode)
+      local db="$HOME/.local/share/opencode/opencode.db"
+      [ -f "$db" ] || return 0
+      sqlite3 -separator $'\t' "file:$db?mode=ro" \
+        "select id, datetime(time_updated/1000,'unixepoch','localtime'), title from session
+         where directory = '$(printf '%s' "$CWD" | sed "s/'/''/g")' and parent_id is null and time_archived is null
+         order by time_updated desc" ;;
+  esac
+}
+
+if [ "${1:-}" = "--list" ]; then
+  OUT="$(list_sessions)"; [ -n "$OUT" ] || die "no $AGENT sessions found for $CWD"
+  printf '%s\n' "$OUT" | awk -F'\t' '{printf "%s  %s  %s\n", $2, $1, $3}'; exit 0
+fi
+
+HOST="${1:-${HANDOFF_HOST:-}}"
+[ -n "$HOST" ] || usage 1
+SID="${2:-$(list_sessions | head -1 | cut -f1)}"
+[ -n "$SID" ] || die "no $AGENT sessions found for $CWD"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST")
+
+# ---------- resolve the session locally ----------
+case "$AGENT" in
+  claude)
+    LOCAL_FILE="$(find "$HOME/.claude/projects" -maxdepth 2 -name "$SID.jsonl" 2>/dev/null | head -1)"
+    [ -n "$LOCAL_FILE" ] || die "claude session '$SID' not found" ;;
+  codex)
+    LOCAL_FILE="$(find "$HOME/.codex/sessions" -name "rollout-*-$SID.jsonl" 2>/dev/null | head -1)"
+    [ -n "$LOCAL_FILE" ] || die "codex session '$SID' not found" ;;
+  opencode)
+    command -v opencode >/dev/null || die "opencode is not installed here" ;;
+esac
+
+# ---------- target ----------
+REMOTE_HOME="$("${SSH[@]}" 'printf %s "$HOME"')" || die "can't reach '$HOST' over ssh"
+DEST="${HANDOFF_DEST:-$REMOTE_HOME}"; DEST="${DEST/#\~/$REMOTE_HOME}"
+REMOTE_ROOT="$DEST/$NAME"
+REMOTE_CWD="$REMOTE_ROOT${CWD#$ROOT}"
+"${SSH[@]}" "command -v $AGENT >/dev/null || [ -x ~/.opencode/bin/$AGENT ]" || die "$AGENT is not installed on $HOST"
+
+echo "→ copying  $ROOT  →  $HOST:$REMOTE_ROOT"
+echo "→ $AGENT session  $SID"
+
+cd "$ROOT"
+LIST="$(mktemp)"; TMP="$(mktemp -d)"; trap 'rm -rf "$LIST" "$TMP"' EXIT
+TAR=(env COPYFILE_DISABLE=1 tar --no-xattrs)
+
+# ---------- 1. project files: respects .gitignore, keeps git history (incl. uncommitted work) ----------
+IS_GIT=0; WORKTREE=0
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  IS_GIT=1
+  GITDIR="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
+  COMMON="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+  # A worktree's .git is a file pointing at the main repo by a local path; it becomes a normal repo there.
+  [ "$GITDIR" != "$COMMON" ] && WORKTREE=1
+  git ls-files -z -co --exclude-standard > "$LIST"
+  [ "$WORKTREE" = 0 ] && printf '.git\0' >> "$LIST"
+else
+  find . -mindepth 1 -maxdepth 1 ! -name node_modules ! -name .venv -print0 > "$LIST"
+fi
+[ "${HANDOFF_ENV:-0}" = "1" ] && find . -maxdepth 3 -name '.env*' -not -path '*/node_modules/*' -print0 >> "$LIST"
+
+# iCloud-synced folders can hold cloud-only ("dataless") files that tar can't read: fetch them first.
+fetch_icloud() {
+  command -v brctl >/dev/null || return 0
+  local i EVICTED
+  for i in $(seq 1 30); do
+    EVICTED="$(find "$1" -flags +dataless -not -path '*/node_modules/*' 2>/dev/null)"
+    [ -z "$EVICTED" ] && return 0
+    [ "$i" = 1 ] && echo "→ downloading $(printf '%s\n' "$EVICTED" | wc -l | tr -d ' ') cloud-only file(s) from iCloud"
+    printf '%s\n' "$EVICTED" | while read -r f; do brctl download "$f" 2>/dev/null || true; done
+    sleep 2
+  done
+}
+fetch_icloud .
+[ "$WORKTREE" = 1 ] && fetch_icloud "$COMMON"
+
+set +e
+"${TAR[@]}" -czf - --null -T "$LIST" 2>"$TMP/tar.err" |
+  "${SSH[@]}" "mkdir -p '$REMOTE_ROOT' && tar -xzf - -C '$REMOTE_ROOT' 2>/dev/null"
+[ "${PIPESTATUS[0]}" -ne 0 ] && { echo "⚠ some files could not be copied:"; sed 's/^/    /' "$TMP/tar.err" | head -10; }
+if [ "$WORKTREE" = 1 ]; then
+  # The main repo's git data (minus its worktree bookkeeping) + this worktree's HEAD and index.
+  echo "→ worktree: becomes a standalone repo on $(git rev-parse --abbrev-ref HEAD) there"
+  "${TAR[@]}" -czf - -C "$COMMON" --exclude ./worktrees . 2>>"$TMP/tar.err" |
+    "${SSH[@]}" "cd '$REMOTE_ROOT' && rm -rf .git && mkdir .git && tar -xzf - -C .git 2>/dev/null"
+  "${TAR[@]}" -czf - -C "$GITDIR" HEAD index 2>>"$TMP/tar.err" |
+    "${SSH[@]}" "tar -xzf - -C '$REMOTE_ROOT/.git' 2>/dev/null && git -C '$REMOTE_ROOT' config core.bare false"
+fi
+set -e
+
+# Git remotes over ssh (git@host:… / ssh://…) only work there if that machine can log in to the host
+# over ssh. Where it can't, its copy fetches and pushes over https instead (a url.insteadOf in the
+# copy's own .git/config; your local repo is untouched).
+remote_https_fix() { cat <<'EOF'
+cd "$R" 2>/dev/null && [ -d .git ] || exit 0
+git config --get-regexp '^remote\..*\.url$' | while read -r key url; do
+  r="${key#remote.}"; r="${r%.url}"
+  eff="$(git ls-remote --get-url "$r" 2>/dev/null)"
+  case "$eff" in https://*)
+    # https: keep it if it works there; else use ssh when that machine has an ssh login to the host.
+    GIT_TERMINAL_PROMPT=0 timeout 20 git ls-remote "$r" HEAD >/dev/null 2>&1 && continue
+    host="${eff#https://}"; host="${host%%/*}"; host="${host##*@}"
+    if ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 "git@$host" </dev/null 2>&1 |
+       grep -qiE 'successfully authenticated|welcome to gitlab|logged in as'; then
+      git config --get-all "url.git@$host:.insteadOf" 2>/dev/null | grep -qxF "https://$host/" ||
+        git config --add "url.git@$host:.insteadOf" "https://$host/"
+      echo "ssh:$host"
+    fi
+    continue ;;
+  esac
+  case "$url" in
+    git@*:*)  userhost="${url%%:*}"; pre="$userhost:" ;;
+    ssh://*)  rest="${url#ssh://}"; userhost="${rest%%/*}"; pre="ssh://$userhost/" ;;
+    *) continue ;;
+  esac
+  hp="${userhost#*@}"; host="${hp%%:*}"; port=22; [ "$hp" != "$host" ] && port="${hp#*:}"
+  user=git; case "$userhost" in *@*) user="${userhost%%@*}" ;; esac
+  if ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -p "$port" "$user@$host" </dev/null 2>&1 |
+     grep -qiE 'successfully authenticated|welcome to gitlab|logged in as'; then continue; fi
+  git config --get-all "url.https://$host/.insteadOf" 2>/dev/null | grep -qxF "$pre" ||
+    git config --add "url.https://$host/.insteadOf" "$pre"
+  echo "$host"
+done | sort -u | tr '\n' ' '
+EOF
+}
+if [ "$IS_GIT" = 1 ]; then
+  SWITCHED="$(remote_https_fix | "${SSH[@]}" "R='$REMOTE_ROOT' sh -s" || true)"
+  for h in $SWITCHED; do
+    case "$h" in
+      ssh:*) echo "→ git: ${h#ssh:} remotes use ssh there (https has no login on $HOST)" ;;
+      *)     echo "→ git: $h remotes use https there (no ssh login to it on $HOST)" ;;
+    esac
+  done
+fi
+
+# ---------- 2. the session, local paths rewritten to the remote ones ----------
+mkdir -p "$TMP/s"
+case "$AGENT" in
+  claude)
+    REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(enc "$REMOTE_CWD")"
+    sed "s#$ROOT#$REMOTE_ROOT#g" "$LOCAL_FILE" > "$TMP/s/$SID.jsonl"
+    [ -d "${LOCAL_FILE%.jsonl}" ] && cp -R "${LOCAL_FILE%.jsonl}" "$TMP/s/$SID"
+    "${TAR[@]}" -czf - -C "$TMP/s" . | "${SSH[@]}" "mkdir -p '$REMOTE_DIR' && tar -xzf - -C '$REMOTE_DIR'"
+    # Pre-accept Claude's folder-trust prompt there (your own project). Needs python3 or jq; else asked once.
+    "${SSH[@]}" "P='$REMOTE_CWD' sh -s" <<'EOF' || true
+f="$HOME/.claude.json"
+if command -v python3 >/dev/null; then
+  python3 -I - "$f" "$P" <<'PY'
+import json, os, sys
+f, p = sys.argv[1], sys.argv[2]
+d = json.load(open(f)) if os.path.exists(f) else {}
+d.setdefault("projects", {}).setdefault(p, {})["hasTrustDialogAccepted"] = True
+json.dump(d, open(f + ".tmp", "w"), indent=2); os.replace(f + ".tmp", f)
+PY
+elif command -v jq >/dev/null; then
+  [ -f "$f" ] || echo '{}' > "$f"
+  jq --arg p "$P" '.projects[$p].hasTrustDialogAccepted = true' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+fi
+EOF
+    RESUME=(claude --resume "$SID") ;;
+  codex)
+    REL="${LOCAL_FILE#$HOME/.codex/sessions/}"
+    mkdir -p "$TMP/s/$(dirname "$REL")"
+    sed "s#$ROOT#$REMOTE_ROOT#g" "$LOCAL_FILE" > "$TMP/s/$REL"
+    "${TAR[@]}" -czf - -C "$TMP/s" . | "${SSH[@]}" "mkdir -p ~/.codex/sessions && tar -xzf - -C ~/.codex/sessions"
+    RESUME=(codex resume "$SID") ;;
+  opencode)
+    opencode export "$SID" 2>/dev/null > "$TMP/raw.json" || die "opencode couldn't export '$SID'"
+    sed "s#$ROOT#$REMOTE_ROOT#g" "$TMP/raw.json" | gzip |
+      "${SSH[@]}" "PATH=\$HOME/.opencode/bin:\$PATH; f=\$(mktemp); gunzip > \$f && cd '$REMOTE_CWD' && opencode import \$f >/dev/null; r=\$?; rm -f \$f; exit \$r" \
+      || die "opencode import failed on $HOST"
+    RESUME=(opencode -s "$SID") ;;
+esac
+# shellcheck disable=SC2206
+RESUME+=(${HANDOFF_AGENT_ARGS:-})
+
+# ---------- 3. resume it there, in Herdr ----------
+by_hand="ssh $HOST, then: cd $REMOTE_CWD && ${RESUME[*]}"
+if [ "${HANDOFF_NO_HERDR:-0}" = "1" ] || ! command -v hc >/dev/null; then
+  echo "✓ copied. Resume it with: $by_hand"; exit 0
+fi
+find_machine() { hc machine ls --json | python3 -I -c '
+import json, sys
+h = sys.argv[1]
+for m in json.load(sys.stdin)["machines"]:
+    if h in (m.get("target"), m.get("name"), m.get("host")): print(m["name"]); break' "$HOST"; }
+MACHINE="$(find_machine)"
+if [ -z "$MACHINE" ]; then
+  echo "→ adding $HOST to Herdr"
+  hc machine add "$HOST" --install --json >/dev/null 2>&1 || true
+  MACHINE="$(find_machine)"
+  [ -n "$MACHINE" ] || { echo "✓ copied, but couldn't add $HOST to Herdr. Resume it with: $by_hand"; exit 0; }
+fi
+TNAME="$AGENT-$(printf '%s' "${SID#ses_}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-8)"
+hc rm "$MACHINE/$TNAME" >/dev/null 2>&1 || true   # clear a finished terminal from an earlier handoff
+hc run --bg --no-parent --on "$MACHINE" --cwd "$REMOTE_CWD" --name "$TNAME" "${RESUME[@]}" >/dev/null 2>&1 \
+  || { echo "✓ copied, but couldn't open it in Herdr (is '$MACHINE/$TNAME' still running?). Resume it with: $by_hand"; exit 0; }
+
+echo "✓ $AGENT session resumed on $MACHINE as Herdr terminal '$MACHINE/$TNAME'"
+echo "  The local session is unchanged. Close it so two agents don't work on the same code."

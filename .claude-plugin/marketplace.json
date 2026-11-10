@@ -1,0 +1,13 @@
+{
+  "name": "handoff",
+  "owner": {
+    "name": "Reinhard Mengelberg"
+  },
+  "plugins": [
+    {
+      "name": "handoff",
+      "source": "./"
+    }
+  ],
+  "description": "handoff: copy a coding-agent session and its project to another machine over ssh and resume it there"
+}

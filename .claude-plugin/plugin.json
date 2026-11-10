@@ -1,0 +1,11 @@
+{
+  "name": "handoff",
+  "version": "0.1.0",
+  "description": "Copy a Claude Code session and its project to another machine over ssh, and resume it there in Herdr",
+  "license": "MIT",
+  "author": {
+    "name": "Reinhard Mengelberg",
+    "url": "https://github.com/ReinMengelberg"
+  },
+  "repository": "https://github.com/ReinMengelberg/handoff"
+}
