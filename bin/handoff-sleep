@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""handoff-sleep: runs on a boxd VM and hibernates it once it has been quiet for a while.
+
+Quiet means: no agent in a Herdr terminal is working, and no terminal on the machine (Herdr's or
+an ssh login's) has had input or output, for SLEEP_MIN minutes. A Herdr client that stays
+connected does not count: its keepalives don't touch any terminal. Hibernating keeps memory, so
+every terminal and agent is where it was when the VM wakes.
+
+Settings (~/.config/handoff/sleep.env, KEY=VALUE lines, or the environment):
+  SLEEP_MIN=10    minutes of quiet before hibernating (0 = never)
+  TICK_SEC=30     how often to look
+Installed and kept up to date by `handoff` as a systemd user service (handoff-sleep.service).
+"""
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+HC = shutil.which("hc") or os.path.join(HOME, ".local/bin/hc")
+BOXD = shutil.which("boxd") or "/usr/local/bin/boxd"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def settings():
+    conf = {"SLEEP_MIN": "10", "TICK_SEC": "30"}
+    try:
+        with open(os.path.join(HOME, ".config/handoff/sleep.env")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    conf[k.strip()] = v.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    for k in conf:
+        conf[k] = os.environ.get(k, conf[k])
+    return float(conf["SLEEP_MIN"]), max(5.0, float(conf["TICK_SEC"]))
+
+
+def last_terminal_activity():
+    """Newest input/output on any of our terminals (pty atime/mtime, as `w` reads idle time)."""
+    uid, newest = os.getuid(), 0.0
+    for pts in glob.glob("/dev/pts/[0-9]*"):
+        try:
+            st = os.stat(pts)
+        except OSError:
+            continue
+        if st.st_uid == uid:
+            newest = max(newest, st.st_atime, st.st_mtime)
+    return newest
+
+
+def agent_working():
+    """True when Herdr reports an agent as working (it may be busy without printing)."""
+    if not os.path.exists(HC):
+        return False
+    try:
+        live = json.loads(subprocess.run([HC, "ls", "--json"], capture_output=True, text=True, timeout=20).stdout)
+        for t in live.get("terminals", []):
+            if t.get("state") != "live" or t.get("agent") in (None, "zsh", "bash", "sh", "fish"):
+                continue
+            got = subprocess.run([HC, "get", t["address"], "--json"], capture_output=True, text=True, timeout=20)
+            if ((json.loads(got.stdout).get("status") or {}).get("state")) == "working":
+                return True
+    except Exception as err:  # never let a Herdr hiccup put the machine to sleep
+        log(f"could not read Herdr terminals ({err}); counting as busy")
+        return True
+    return False
+
+
+def main():
+    quiet_since = time.time()
+    last_tick = time.time()
+    while True:
+        sleep_min, tick = settings()
+        time.sleep(tick)
+        now = time.time()
+        if now - last_tick > tick * 3:  # we were asleep: start counting afresh
+            quiet_since = now
+        last_tick = now
+        if sleep_min <= 0:
+            continue
+        if agent_working():
+            quiet_since = now
+            continue
+        quiet_since = max(quiet_since, last_terminal_activity())
+        if now - quiet_since >= sleep_min * 60:
+            log(f"quiet for {int((now - quiet_since) / 60)} min: hibernating")
+            subprocess.run([BOXD, "machine", "hibernate", "--confirm"], timeout=120)
+            quiet_since = last_tick = time.time()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

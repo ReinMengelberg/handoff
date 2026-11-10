@@ -64,6 +64,19 @@ handoff --hosts
 4. **Resumes it** with `claude --resume` / `codex resume` / `opencode -s` as a Herdr terminal on that machine,
    adding the machine to Herdr on first use. Without Herdr (`hc`), it prints the command to resume by hand.
 
+## boxd VMs: wake on handoff, sleep when quiet
+
+For a [boxd](https://boxd.sh) target (an alias `<vm>.boxd`, with the `boxd` CLI installed locally), handoff also:
+
+- **wakes the VM** first (resume, wake or start, whatever state it is in);
+- installs **`handoff-sleep`** there, a systemd user service that hibernates the VM once no agent is working and
+  no terminal has had input or output for `SLEEP_MIN` minutes (default 10; set in `~/.config/handoff/sleep.env`
+  on the VM, or with `HANDOFF_SLEEP_MIN` on a handoff; `0` turns it off). Hibernating keeps memory, so terminals
+  and agents are where they were when it wakes;
+- connects Herdr to it through **`handoff-boxd via`**, which only lets Herdr in while the VM is awake. Herdr can
+  stay connected without keeping the VM awake, and its reconnects never wake it. The VM shows as unreachable in
+  Herdr while it sleeps; the next handoff, or `handoff-boxd wake <vm>.boxd`, wakes it and Herdr reconnects.
+
 ## Requirements
 
 - ssh access to the target (an alias in `~/.ssh/config` or `user@host`), with `tar` and `git` there
@@ -79,6 +92,7 @@ handoff --hosts
 | `HANDOFF_ENV=1` | also copy gitignored `.env*` files |
 | `HANDOFF_AGENT_ARGS` | extra flags for the agent there |
 | `HANDOFF_NO_HERDR=1` | copy only; print the resume command |
+| `HANDOFF_SLEEP_MIN` | boxd VMs: minutes of quiet before it hibernates (`0` = never) |
 
 ## License
 

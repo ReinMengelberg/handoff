@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# handoff-boxd: helpers for handing off to boxd VMs (ssh aliases <vm>.boxd).
+#
+#   handoff-boxd via <alias> <shell-line>   connect for Herdr (`hc machine add --via`), but only while
+#                                           the VM is awake, so Herdr's reconnects never wake it
+#   handoff-boxd wake <alias>               wake or start the VM and wait until it runs
+#   handoff-boxd status <alias>             running / standby / hibernated / stopped / ...
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+CMD="${1:-}"; ALIAS="${2:-}"
+[ -n "$CMD" ] && [ -n "$ALIAS" ] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+VM="${ALIAS%.boxd.sh}"; VM="${VM%.boxd}"; VM="${VM#*@}"
+CACHE="$HOME/.cache/handoff"; ORGFILE="$CACHE/boxd-org-$VM"
+
+# The VM lives in one of your orgs: try the remembered one, the active one, then each.
+status() {
+  local org out
+  if [ -f "$ORGFILE" ]; then
+    org="$(cat "$ORGFILE")"
+    out="$(boxd --org "$org" machine get "$VM" --json 2>/dev/null)" && { printf '%s' "$out"; return 0; }
+  fi
+  out="$(boxd machine get "$VM" --json 2>/dev/null)" && { printf '%s' "$out"; return 0; }
+  while IFS= read -r org; do
+    out="$(boxd --org "$org" machine get "$VM" --json 2>/dev/null)" || continue
+    mkdir -p "$CACHE" && printf '%s' "$org" > "$ORGFILE"
+    printf '%s' "$out"; return 0
+  done < <(boxd auth --json 2>/dev/null | python3 -I -c 'import json,sys; [print(o["name"]) for o in json.load(sys.stdin)["orgs"]]')
+  return 1
+}
+state() { status | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null; }
+boxd_vm() { if [ -f "$ORGFILE" ]; then boxd --org "$(cat "$ORGFILE")" machine "$@"; else boxd machine "$@"; fi; }
+
+case "$CMD" in
+  status) state || { echo "unknown"; exit 1; } ;;
+  via)
+    LINE="${3:-}"
+    S="$(state)"
+    # Unknown (boxd API unreachable): connect anyway, as plain ssh would.
+    if [ -n "$S" ] && [ "$S" != "running" ]; then
+      echo "$VM is $S; it stays asleep until a handoff (or 'handoff-boxd wake $ALIAS') wakes it" >&2
+      exit 255
+    fi
+    exec ssh -o BatchMode=yes -o ServerAliveInterval=30 "$ALIAS" "$LINE" ;;
+  wake)
+    S="$(state)" || { echo "handoff-boxd: no boxd machine '$VM' in your orgs" >&2; exit 1; }
+    case "$S" in
+      running) exit 0 ;;
+      standby) boxd_vm resume "$VM" >/dev/null 2>&1 ;;
+      hibernated|hibernating) boxd_vm wake "$VM" >/dev/null 2>&1 ;;
+      stopped) boxd_vm start "$VM" >/dev/null 2>&1 ;;
+    esac
+    echo "→ waking $VM ($S)" >&2
+    for _ in $(seq 1 60); do [ "$(state)" = running ] && exit 0; sleep 2; done
+    echo "handoff-boxd: $VM did not come up (last: $(state))" >&2; exit 1 ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

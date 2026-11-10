@@ -89,11 +89,55 @@ case "$AGENT" in
 esac
 
 # ---------- target ----------
+# boxd VMs: wake (or start) them first; they also get a sleep watcher and a Herdr connection that lets them sleep.
+SELF_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+IS_BOXD=0
+case "$HOST" in *.boxd|*.boxd.sh) command -v boxd >/dev/null && [ -x "$SELF_DIR/handoff-boxd" ] && IS_BOXD=1 ;; esac
+if [ "$IS_BOXD" = 1 ]; then "$SELF_DIR/handoff-boxd" wake "$HOST" || die "couldn't wake $HOST"; fi
 REMOTE_HOME="$("${SSH[@]}" 'printf %s "$HOME"')" || die "can't reach '$HOST' over ssh"
 DEST="${HANDOFF_DEST:-$REMOTE_HOME}"; DEST="${DEST/#\~/$REMOTE_HOME}"
 REMOTE_ROOT="$DEST/$NAME"
 REMOTE_CWD="$REMOTE_ROOT${CWD#$ROOT}"
 "${SSH[@]}" "command -v $AGENT >/dev/null || [ -x ~/.opencode/bin/$AGENT ]" || die "$AGENT is not installed on $HOST"
+
+sleep_setup() { cat <<'EOF'
+set -e
+cd ~/.local/bin && chmod +x handoff-sleep.new
+changed=1; cmp -s handoff-sleep.new handoff-sleep && changed=0
+mv handoff-sleep.new handoff-sleep
+mkdir -p ~/.config/systemd/user ~/.config/handoff
+c=~/.config/handoff/sleep.env
+[ -n "$SM" ] && printf 'SLEEP_MIN=%s\n' "$SM" > "$c"
+[ -f "$c" ] || printf 'SLEEP_MIN=10\n' > "$c"
+u=~/.config/systemd/user/handoff-sleep.service
+cat > "$u.new" <<'UNIT'
+[Unit]
+Description=handoff-sleep: hibernate this VM when its terminals are quiet
+
+[Service]
+ExecStart=%h/.local/bin/handoff-sleep
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+if cmp -s "$u.new" "$u"; then rm "$u.new"; else mv "$u.new" "$u"; changed=1; fi
+systemctl --user daemon-reload
+systemctl --user enable handoff-sleep.service >/dev/null 2>&1
+if [ "$changed" = 1 ]; then systemctl --user restart handoff-sleep.service; else systemctl --user start handoff-sleep.service; fi
+sed -n 's/^SLEEP_MIN=//p' "$c"
+EOF
+}
+if [ "$IS_BOXD" = 1 ] && [ -f "$SELF_DIR/handoff-sleep" ] &&
+   "${SSH[@]}" 'command -v boxd && command -v python3 && command -v systemctl' >/dev/null 2>&1; then
+  "${SSH[@]}" 'mkdir -p ~/.local/bin && cat > ~/.local/bin/handoff-sleep.new' < "$SELF_DIR/handoff-sleep"
+  MINS="$(sleep_setup | "${SSH[@]}" "SM='${HANDOFF_SLEEP_MIN:-}' sh -s" 2>/dev/null)" || MINS=""
+  if [ -z "$MINS" ]; then echo "⚠ couldn't set up the sleep watcher on $HOST"
+  elif [ "$MINS" = 0 ]; then echo "→ sleep: off on $HOST (SLEEP_MIN=0)"
+  else echo "→ sleep: $HOST hibernates after $MINS min with no agent working and no terminal activity"; fi
+fi
 
 echo "→ copying  $ROOT  →  $HOST:$REMOTE_ROOT"
 echo "→ $AGENT session  $SID"
@@ -237,16 +281,26 @@ by_hand="ssh $HOST, then: cd $REMOTE_CWD && ${RESUME[*]}"
 if [ "${HANDOFF_NO_HERDR:-0}" = "1" ] || ! command -v hc >/dev/null; then
   echo "✓ copied. Resume it with: $by_hand"; exit 0
 fi
+VIA=""; HNAME=""
+if [ "$IS_BOXD" = 1 ]; then VIA="$(command -v handoff-boxd || echo "$SELF_DIR/handoff-boxd") via $HOST"; HNAME="${HOST%.boxd.sh}"; HNAME="${HNAME%.boxd}"; fi
 find_machine() { hc machine ls --json | python3 -I -c '
 import json, sys
-h = sys.argv[1]
+h, via, name = sys.argv[1:4]
 for m in json.load(sys.stdin)["machines"]:
-    if h in (m.get("target"), m.get("name"), m.get("host")): print(m["name"]); break' "$HOST"; }
-MACHINE="$(find_machine)"
+    t = m.get("target") or ""
+    if h in (t, m.get("name"), m.get("host")) or (via and t == via) or (name and m.get("name") == name):
+        print(m["name"], "via" if m.get("via") else "ssh"); break' "$HOST" "$VIA" "$HNAME"; }
+read -r MACHINE MKIND <<<"$(find_machine)" || true
+if [ -n "$VIA" ] && [ -n "$MACHINE" ] && [ "$MKIND" != via ]; then
+  echo "→ Herdr: reconnecting $MACHINE through handoff-boxd, so Herdr can't keep it awake"
+  hc machine rm "$MACHINE" >/dev/null 2>&1 || true
+  MACHINE=""
+fi
 if [ -z "$MACHINE" ]; then
   echo "→ adding $HOST to Herdr"
-  hc machine add "$HOST" --install --json >/dev/null 2>&1 || true
-  MACHINE="$(find_machine)"
+  if [ -n "$VIA" ]; then hc machine add --via "$VIA" --name "$HNAME" --install --json >/dev/null 2>&1 || true
+  else hc machine add "$HOST" --install --json >/dev/null 2>&1 || true; fi
+  read -r MACHINE MKIND <<<"$(find_machine)" || true
   [ -n "$MACHINE" ] || { echo "✓ copied, but couldn't add $HOST to Herdr. Resume it with: $by_hand"; exit 0; }
 fi
 TNAME="$AGENT-$(printf '%s' "${SID#ses_}" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-8)"
